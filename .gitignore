@@ -1,3 +1,5 @@
 Applications/*
+library.sqlite
+storage/
 __pycache__/
 *.pyc

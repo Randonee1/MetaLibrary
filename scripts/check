@@ -10,6 +10,8 @@ fail() {
   exit 1
 }
 
+PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" "$ROOT/scripts/library" check >/dev/null
+
 [ -f "$DB" ] || fail "missing library.sqlite"
 [ -d "$ROOT/storage" ] || fail "missing storage directory"
 [ -d "$ROOT/Applications" ] || fail "missing Applications directory"

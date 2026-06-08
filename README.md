@@ -1,20 +1,20 @@
-# Library
+# MetaLibrary
 
-Library is a local-first metadata and file storage system for papers, books, web pages, reports, and other readable or citable materials.
+MetaLibrary is a local-first metadata and file storage system for papers, books, web pages, reports, and other readable or citable materials.
 
 Current minimal layout:
 
 ```text
-Library/
+MetaLibrary/
   library.sqlite
   storage/
   src/
   Applications/
 ```
 
-The long-term goal is to provide a stable Library Core with HTTP API and CLI interfaces so external applications can read and write library data without depending on the internal SQLite schema or storage layout.
+The long-term goal is to provide a stable MetaLibrary Core with HTTP API and CLI interfaces so external applications can read and write library data without depending on the internal SQLite schema or storage layout.
 
-`src/` contains the Library system implementation. `Applications/` is a root-level workspace for many independent application repositories that use Library through API or CLI.
+`src/` contains the MetaLibrary system implementation. `Applications/` is a root-level workspace for independent application repositories that use MetaLibrary through API or CLI. Concrete acquisition and application workflows should live in `Applications/` or standalone scripts, and should use MetaLibrary public interfaces for persistent writes.
 
 Run the project health check:
 

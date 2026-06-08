@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+ROOT = Path(__file__).resolve().parents[1]
+LIBRARY_CLI = ROOT / "scripts" / "library"
+CVPR_PUBLICATION_TITLE = (
+    "Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)"
+)
+CVPR_PUBLISHER = "Computer Vision Foundation"
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def cvpr_all_papers_url(year: int) -> str:
+    return f"https://openaccess.thecvf.com/CVPR{year}?day=all"
+
+
+def safe_filename(name: str) -> str:
+    cleaned = _SAFE_NAME.sub("_", name).strip("._")
+    return cleaned or "file"
+
+
+@dataclass
+class CVPRPaperEntry:
+    year: int
+    title: str
+    html_url: str
+    pdf_url: str
+    bibtex: str = ""
+
+    @property
+    def filename(self) -> str:
+        return safe_filename(Path(urlparse(self.pdf_url).path).name)
+
+    @property
+    def pages(self) -> str | None:
+        match = re.search(r"pages\s*=\s*\{([^}]+)\}", self.bibtex)
+        return match.group(1).strip() if match else None
+
+    @property
+    def authors(self) -> list[str]:
+        match = re.search(r"author\s*=\s*\{([^}]+)\}", self.bibtex, re.DOTALL)
+        if not match:
+            return []
+        return [part.strip() for part in match.group(1).split(" and ") if part.strip()]
+
+    def extra_payload(self) -> str:
+        return json.dumps(
+            {
+                "source": "cvf_open_access",
+                "conference": "CVPR",
+                "year": self.year,
+                "html_url": self.html_url,
+                "pdf_url": self.pdf_url,
+                "authors": self.authors,
+                "bibtex": self.bibtex.strip(),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+
+
+class CVFAllPapersParser(HTMLParser):
+    def __init__(self, *, year: int, base_url: str) -> None:
+        super().__init__()
+        self.year = year
+        self.base_url = base_url
+        self.entries: list[CVPRPaperEntry] = []
+        self.current: dict[str, str] | None = None
+        self.in_title_dt = False
+        self.capture_title = False
+        self.capture_anchor_text = False
+        self.current_anchor_href: str | None = None
+        self.anchor_text_parts: list[str] = []
+        self.title_parts: list[str] = []
+        self.in_bibref = False
+        self.bibtex_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = {key: value or "" for key, value in attrs}
+        classes = attr_map.get("class", "").split()
+        if tag == "dt" and "ptitle" in classes:
+            self._finish_current()
+            self.current = {"title": "", "html_url": "", "pdf_url": "", "bibtex": ""}
+            self.in_title_dt = True
+            return
+        if tag == "a":
+            href = attr_map.get("href")
+            if self.in_title_dt and self.current is not None and href:
+                self.capture_title = True
+                self.current_anchor_href = urljoin(self.base_url, href)
+                self.title_parts = []
+                return
+            if self.current is not None and href:
+                self.capture_anchor_text = True
+                self.current_anchor_href = urljoin(self.base_url, href)
+                self.anchor_text_parts = []
+                return
+        if tag == "div" and "bibref" in classes and self.current is not None:
+            self.in_bibref = True
+            self.bibtex_parts = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "dt":
+            self.in_title_dt = False
+            return
+        if tag == "a" and self.capture_title and self.current is not None:
+            self.current["title"] = self._collapse("".join(self.title_parts))
+            self.current["html_url"] = self.current_anchor_href or ""
+            self.capture_title = False
+            self.current_anchor_href = None
+            self.title_parts = []
+            return
+        if tag == "a" and self.capture_anchor_text and self.current is not None:
+            text = self._collapse("".join(self.anchor_text_parts)).lower()
+            if text == "pdf":
+                self.current["pdf_url"] = self.current_anchor_href or ""
+            self.capture_anchor_text = False
+            self.current_anchor_href = None
+            self.anchor_text_parts = []
+            return
+        if tag == "div" and self.in_bibref and self.current is not None:
+            self.current["bibtex"] = self._normalize_bibtex("".join(self.bibtex_parts))
+            self.in_bibref = False
+            self.bibtex_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self.capture_title:
+            self.title_parts.append(data)
+        elif self.capture_anchor_text:
+            self.anchor_text_parts.append(data)
+        elif self.in_bibref:
+            self.bibtex_parts.append(data)
+
+    def close(self) -> None:
+        super().close()
+        self._finish_current()
+
+    def _finish_current(self) -> None:
+        if self.current is None:
+            return
+        title = self._collapse(self.current.get("title", ""))
+        html_url = self.current.get("html_url", "").strip()
+        pdf_url = self.current.get("pdf_url", "").strip()
+        if title and html_url and pdf_url:
+            self.entries.append(
+                CVPRPaperEntry(
+                    year=self.year,
+                    title=title,
+                    html_url=html_url,
+                    pdf_url=pdf_url,
+                    bibtex=self.current.get("bibtex", "").strip(),
+                )
+            )
+        self.current = None
+
+    @staticmethod
+    def _collapse(text: str) -> str:
+        return " ".join(text.split())
+
+    @staticmethod
+    def _normalize_bibtex(text: str) -> str:
+        lines = [line.rstrip() for line in text.splitlines()]
+        return "\n".join(line for line in lines if line.strip())
+
+
+def request_for(url: str) -> urllib.request.Request:
+    return urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "MetaLibrary CVPR downloader/1.0",
+            "Accept": "text/html,application/pdf,*/*",
+            "Connection": "close",
+        },
+    )
+
+
+def fetch_url(url: str, *, timeout: float, attempts: int = 3) -> str:
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(request_for(url), timeout=timeout) as response:
+                charset = response.headers.get_content_charset() or "utf-8"
+                return response.read().decode(charset, errors="replace")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+            if attempt < attempts:
+                time.sleep(min(2 ** (attempt - 1), 8))
+    raise RuntimeError(f"failed to fetch {url} after {attempts} attempts: {last_error}")
+
+
+def fetch_binary(url: str, destination: Path, *, timeout: float, attempts: int = 3) -> None:
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(request_for(url), timeout=timeout) as response:
+                with destination.open("wb") as handle:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+            return
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+            if destination.exists():
+                destination.unlink()
+            if attempt < attempts:
+                time.sleep(min(2 ** (attempt - 1), 8))
+    raise RuntimeError(f"failed to fetch {url} after {attempts} attempts: {last_error}")
+
+
+def parse_cvpr_listing(html: str, *, year: int, base_url: str | None = None) -> list[CVPRPaperEntry]:
+    parser = CVFAllPapersParser(year=year, base_url=base_url or cvpr_all_papers_url(year))
+    parser.feed(html)
+    parser.close()
+    return parser.entries
+
+
+def load_cvpr_entries(year: int, *, timeout: float) -> list[CVPRPaperEntry]:
+    listing_url = cvpr_all_papers_url(year)
+    html = fetch_url(listing_url, timeout=timeout)
+    return parse_cvpr_listing(html, year=year, base_url=listing_url)
+
+
+def run_library(args: list[str]) -> dict[str, object]:
+    completed = subprocess.run(
+        [str(LIBRARY_CLI), "--json", *args],
+        check=False,
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(f"library command failed: {' '.join(args)}: {message}")
+    try:
+        data = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"library command did not return JSON: {' '.join(args)}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"library command returned non-object JSON: {' '.join(args)}")
+    return data
+
+
+def import_entry(entry: CVPRPaperEntry, *, timeout: float) -> dict[str, object]:
+    item = run_library(
+        [
+            "item",
+            "create",
+            "--type",
+            "conference_paper",
+            "--title",
+            entry.title,
+            "--date",
+            str(entry.year),
+            "--url",
+            entry.html_url,
+        ]
+    )
+    item_id = str(item["id"])
+
+    paper_args = [
+        "paper",
+        "create",
+        item_id,
+        "--publication-title",
+        CVPR_PUBLICATION_TITLE,
+        "--publisher",
+        CVPR_PUBLISHER,
+        "--published-date",
+        str(entry.year),
+        "--access-date",
+        cvpr_all_papers_url(entry.year),
+        "--extra",
+        entry.extra_payload(),
+    ]
+    if entry.pages:
+        paper_args.extend(["--pages", entry.pages])
+    run_library(paper_args)
+
+    with tempfile.TemporaryDirectory(prefix=f"library-cvpr{entry.year}-") as tmp:
+        pdf_path = Path(tmp) / entry.filename
+        fetch_binary(entry.pdf_url, pdf_path, timeout=timeout)
+        attachment = run_library(
+            [
+                "attachment",
+                "add",
+                item_id,
+                str(pdf_path),
+                "--title",
+                entry.title,
+                "--type",
+                "pdf",
+            ]
+        )
+
+    return {
+        "item_id": item_id,
+        "attachment_id": attachment.get("id"),
+        "title": entry.title,
+        "pdf_url": entry.pdf_url,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="download_cvpr",
+        description="Download CVPR papers from CVF Open Access and import them through scripts/library.",
+    )
+    parser.add_argument("--year", type=int, default=2026, help="CVPR year to import, default: 2026")
+    parser.add_argument("--limit", type=int, help="import only the first N papers")
+    parser.add_argument("--timeout", type=float, default=120.0, help="network timeout in seconds")
+    parser.add_argument("--list-only", action="store_true", help="only list discovered papers without downloading")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    entries = load_cvpr_entries(args.year, timeout=args.timeout)
+
+    if args.limit is not None:
+        entries = entries[: args.limit]
+
+    print(f"Discovered {len(entries)} CVPR {args.year} papers from CVF Open Access.")
+
+    if args.list_only:
+        for index, entry in enumerate(entries, start=1):
+            print(f"{index}\t{entry.title}\t{entry.pdf_url}")
+        return 0
+
+    for index, entry in enumerate(entries, start=1):
+        result = import_entry(entry, timeout=args.timeout)
+        print(f"{index}/{len(entries)}\t{result['item_id']}\tcreated,pdf\t{result['title']}")
+
+    print(f"Import complete: processed={len(entries)} library_root={ROOT}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
