@@ -1,0 +1,4 @@
+interface:
+  display_name: "Harness Engineering"
+  short_description: "Build agent-first engineering harnesses"
+  default_prompt: "Use $harness-engineering to design an agent-first repository harness for this codebase."
