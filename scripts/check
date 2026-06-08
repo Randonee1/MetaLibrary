@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DB="$ROOT/library.sqlite"
+
+fail() {
+  printf 'check failed: %s\n' "$1" >&2
+  exit 1
+}
+
+[ -f "$DB" ] || fail "missing library.sqlite"
+[ -d "$ROOT/storage" ] || fail "missing storage directory"
+[ -d "$ROOT/Applications" ] || fail "missing Applications directory"
+[ -f "$ROOT/.gitignore" ] || fail "missing root .gitignore"
+grep -qxF "Applications/*" "$ROOT/.gitignore" || fail "root .gitignore must ignore Applications/*"
+[ -f "$ROOT/AGENTS.md" ] || fail "missing AGENTS.md"
+[ -f "$ROOT/ARCHITECTURE.md" ] || fail "missing ARCHITECTURE.md"
+[ -x "$ROOT/scripts/library" ] || fail "missing executable scripts/library"
+[ -f "$ROOT/docs/design/data-model.md" ] || fail "missing data model document"
+[ -f "$ROOT/docs/design/storage-layout.md" ] || fail "missing storage layout document"
+
+python3 - "$DB" <<'PY'
+import sqlite3
+import sys
+
+db = sys.argv[1]
+required = {
+    "items",
+    "papers",
+    "creators",
+    "item_creators",
+    "blobs",
+    "attachments",
+    "tags",
+    "item_tags",
+    "collections",
+    "collection_items",
+}
+
+con = sqlite3.connect(db)
+try:
+    rows = con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+finally:
+    con.close()
+
+actual = {row[0] for row in rows}
+missing = sorted(required - actual)
+if missing:
+    print("missing required tables: " + ", ".join(missing), file=sys.stderr)
+    sys.exit(1)
+PY
+
+PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m unittest discover -s "$ROOT/tests" -p 'test_*.py'
+
+printf 'Library check passed\n'
