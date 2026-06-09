@@ -67,6 +67,6 @@ MetaLibrary/
 
 ## Database Boundary
 
-`items` is the universal root entity. Type-specific tables such as `papers` or `books` should reference `items.id` as their primary key and foreign key.
+`items` is the durable root entity: each row uniquely identifies one stored physical file (content-addressed by `sha256`). Type-specific metadata tables such as `papers` or `books` extend an item by using `items.id` as both their primary key and foreign key, giving a one-to-one extension.
 
-Attachments belong to `items`, not directly to type-specific tables.
+Descriptive metadata (title, authors, publication details) belongs in the extension tables, not in `items`. `items` holds only file identity.

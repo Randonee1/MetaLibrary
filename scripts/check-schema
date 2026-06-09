@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Standalone schema linter for MetaLibrary's database.
+
+It lints the *code-defined* schema (built fresh via core.db.ensure_schema in a
+temp database), not whatever happens to sit in library.sqlite, so the result is
+reproducible and reflects what the code will actually create.
+
+This enforces the mechanical subset of the project's design principles
+(see AGENTS.md "Design Principles"). It does NOT attempt to prove a given normal
+form — that needs declared functional dependencies and human judgement. The agent
+is expected to run this after editing src/core/db.py and resolve any violations.
+
+Rules
+  E1 missing-table       an EXPECTED table is absent
+  E2 undocumented-table  a table exists that is not in EXPECTED_TABLES (YAGNI gate:
+                         adding a table must be a deliberate edit here + data-model.md)
+  E3 no-primary-key      a table has no PRIMARY KEY
+  E4 missing-foreign-key a column named *_id has no FOREIGN KEY (likely a dangling reference)
+  E5 broken-foreign-key  a FOREIGN KEY points at a table that does not exist
+  W1 numbered-column     a column name ends in a number (e.g. tag1, author_2) — a classic
+                         un-normalized repeating group; use a child table or JSON instead
+"""
+from __future__ import annotations
+
+import re
+import sqlite3
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from core.db import ensure_schema  # noqa: E402
+from core.paths import LibraryPaths  # noqa: E402
+
+# YAGNI gate: the tables that are a deliberate part of the design.
+# Adding a table requires updating this set AND docs/design/data-model.md.
+EXPECTED_TABLES = {"items", "papers"}
+
+# A trailing "_<number>" (author_1, tag_2) signals a repeating group. Deliberately
+# anchored to an underscore so legitimate names like sha256 / md5 / utf8 are not flagged.
+NUMBERED_COLUMN = re.compile(r"_\d+$")
+
+
+def introspect(con: sqlite3.Connection) -> dict[str, dict[str, list]]:
+    tables = [
+        row[0]
+        for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+    ]
+    info: dict[str, dict[str, list]] = {}
+    for table in tables:
+        info[table] = {
+            "columns": con.execute(f"PRAGMA table_info('{table}')").fetchall(),
+            "foreign_keys": con.execute(f"PRAGMA foreign_key_list('{table}')").fetchall(),
+        }
+    return info
+
+
+def lint(info: dict[str, dict[str, list]]) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    tables = set(info)
+
+    # E1 / E2: table allowlist (YAGNI gate).
+    for table in sorted(EXPECTED_TABLES - tables):
+        errors.append(f"[missing-table] expected table '{table}' was not created")
+    for table in sorted(tables - EXPECTED_TABLES):
+        errors.append(
+            f"[undocumented-table] '{table}' is not in EXPECTED_TABLES — adding a table must be a "
+            f"deliberate decision: update scripts/check-schema and docs/design/data-model.md"
+        )
+
+    for table in sorted(tables):
+        columns = info[table]["columns"]  # (cid, name, type, notnull, dflt, pk)
+        foreign_keys = info[table]["foreign_keys"]  # (id, seq, table, from, to, ...)
+        fk_from = {row[3] for row in foreign_keys}
+        pk_columns = [row[1] for row in columns if row[5] > 0]
+
+        # E3: every table needs a primary key.
+        if not pk_columns:
+            errors.append(f"[no-primary-key] table '{table}' has no PRIMARY KEY")
+
+        for row in columns:
+            name = row[1]
+            # E4: a *_id column should be a declared foreign key.
+            if name.endswith("_id") and name not in fk_from:
+                errors.append(
+                    f"[missing-foreign-key] column '{table}.{name}' looks like a reference but has no FOREIGN KEY"
+                )
+            # W1: numbered columns are an un-normalized repeating group.
+            if NUMBERED_COLUMN.search(name):
+                warnings.append(
+                    f"[numbered-column] '{table}.{name}' — numbered columns suggest a repeating group; "
+                    f"use a child table or a JSON column instead"
+                )
+
+        # E5: foreign keys must target existing tables.
+        for row in foreign_keys:
+            referenced = row[2]
+            if referenced not in tables:
+                errors.append(
+                    f"[broken-foreign-key] '{table}.{row[3]}' references missing table '{referenced}'"
+                )
+
+    return errors, warnings
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory(prefix="metalibrary-schema-lint-") as tmp:
+        paths = LibraryPaths(Path(tmp))
+        ensure_schema(paths)
+        con = sqlite3.connect(paths.db)
+        try:
+            info = introspect(con)
+        finally:
+            con.close()
+
+    errors, warnings = lint(info)
+
+    for warning in warnings:
+        print(f"warning: {warning}")
+    for error in errors:
+        print(f"error: {error}", file=sys.stderr)
+
+    if errors:
+        print(
+            f"\nschema check FAILED: {len(info)} tables, {len(errors)} error(s), {len(warnings)} warning(s)",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"schema check passed: {len(info)} tables, {len(warnings)} warning(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

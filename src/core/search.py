@@ -13,18 +13,17 @@ def search_items(query: str, limit: int = 50, paths: LibraryPaths | None = None)
     with connect(paths) as con:
         rows = con.execute(
             """
-            SELECT DISTINCT i.*
+            SELECT i.id, i.storage_path, i.original_filename,
+                   p.type, p.title, p.authors, p.container_title, p.doi
             FROM items i
-            LEFT JOIN papers p ON p.item_id = i.id
-            WHERE i.title LIKE ?
-               OR i.abstract LIKE ?
-               OR i.doi LIKE ?
-               OR i.isbn LIKE ?
-               OR p.publication_title LIKE ?
+            JOIN papers p ON p.item_id = i.id
+            WHERE p.title LIKE ?
+               OR p.authors LIKE ?
+               OR p.container_title LIKE ?
                OR p.doi LIKE ?
             ORDER BY i.created_at DESC, i.id DESC
             LIMIT ?
             """,
-            (pattern, pattern, pattern, pattern, pattern, pattern, limit),
+            (pattern, pattern, pattern, pattern, limit),
         ).fetchall()
     return [row_to_dict(row) or {} for row in rows]

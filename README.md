@@ -24,22 +24,27 @@ scripts/check
 
 ## First Version CLI
 
-Create an item:
+An item is a stored file. Ingest one (deduplicated by content hash):
 
 ```bash
-scripts/library item create --type journal_article --title "Example Paper"
+scripts/library item add /path/to/file.pdf
 ```
 
-Attach paper metadata:
+Attach paper metadata to the returned item id:
 
 ```bash
-scripts/library paper create ITEM_ID --publication-title "Example Journal" --doi "10.example/demo"
+scripts/library paper create ITEM_ID \
+  --type conference_paper \
+  --title "Example Paper" \
+  --container-title "Proceedings of the Example Conference" \
+  --doi "10.example/demo"
 ```
 
-Add a file attachment:
+Inspect an item and its stored file path:
 
 ```bash
-scripts/library attachment add ITEM_ID /path/to/file.pdf
+scripts/library item get ITEM_ID
+scripts/library item path ITEM_ID
 ```
 
 Search:

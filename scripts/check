@@ -31,14 +31,6 @@ db = sys.argv[1]
 required = {
     "items",
     "papers",
-    "creators",
-    "item_creators",
-    "blobs",
-    "attachments",
-    "tags",
-    "item_tags",
-    "collections",
-    "collection_items",
 }
 
 con = sqlite3.connect(db)

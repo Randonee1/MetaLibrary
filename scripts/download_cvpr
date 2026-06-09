@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
+import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -22,6 +24,8 @@ CVPR_PUBLICATION_TITLE = (
 )
 CVPR_PUBLISHER = "Computer Vision Foundation"
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+PDF_MAGIC = b"%PDF"
+DEFAULT_CACHE = Path("/tmp") / "metalibrary-cvpr"
 
 
 def cvpr_all_papers_url(year: int) -> str:
@@ -177,18 +181,18 @@ class CVFAllPapersParser(HTMLParser):
         return "\n".join(line for line in lines if line.strip())
 
 
-def request_for(url: str) -> urllib.request.Request:
-    return urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "MetaLibrary CVPR downloader/1.0",
-            "Accept": "text/html,application/pdf,*/*",
-            "Connection": "close",
-        },
-    )
+def request_for(url: str, *, extra_headers: dict[str, str] | None = None) -> urllib.request.Request:
+    headers = {
+        "User-Agent": "MetaLibrary CVPR downloader/1.0",
+        "Accept": "text/html,application/pdf,*/*",
+        "Connection": "close",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    return urllib.request.Request(url, headers=headers)
 
 
-def fetch_url(url: str, *, timeout: float, attempts: int = 3) -> str:
+def fetch_url(url: str, *, timeout: float, attempts: int = 6) -> str:
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
@@ -198,29 +202,126 @@ def fetch_url(url: str, *, timeout: float, attempts: int = 3) -> str:
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last_error = exc
             if attempt < attempts:
-                time.sleep(min(2 ** (attempt - 1), 8))
+                time.sleep(min(2 ** (attempt - 1), 10) + random.uniform(0, 1.0))
     raise RuntimeError(f"failed to fetch {url} after {attempts} attempts: {last_error}")
 
 
-def fetch_binary(url: str, destination: Path, *, timeout: float, attempts: int = 3) -> None:
+def looks_like_pdf(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(len(PDF_MAGIC)) == PDF_MAGIC
+    except OSError:
+        return False
+
+
+def download_pdf_urllib(
+    entry: CVPRPaperEntry,
+    target: Path,
+    *,
+    timeout: float,
+    attempts: int,
+) -> None:
+    """Stream a PDF to ``target`` with HTTP Range resume and validation.
+
+    A flaky proxy frequently truncates the long-lived TLS connection mid-file
+    (SSL ``UNEXPECTED_EOF``). Keeping a ``.part`` file and resuming from its size
+    lets each retry pick up where the last one was cut, instead of restarting.
+    """
+    part = target.with_name(target.name + ".part")
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
+        offset = part.stat().st_size if part.exists() else 0
+        extra = {"Range": f"bytes={offset}-"} if offset else None
         try:
-            with urllib.request.urlopen(request_for(url), timeout=timeout) as response:
-                with destination.open("wb") as handle:
+            with urllib.request.urlopen(request_for(entry.pdf_url, extra_headers=extra), timeout=timeout) as response:
+                # Server ignored our Range header and sent the whole file again.
+                if offset and response.status != 206:
+                    offset = 0
+                mode = "ab" if offset else "wb"
+                content_length = response.headers.get("Content-Length")
+                expected = (int(content_length) + offset) if (content_length or "").isdigit() else None
+                with part.open(mode) as handle:
                     while True:
-                        chunk = response.read(1024 * 1024)
+                        chunk = response.read(256 * 1024)
                         if not chunk:
                             break
                         handle.write(chunk)
+            size = part.stat().st_size
+            if expected is not None and size < expected:
+                raise RuntimeError(f"incomplete download {size}/{expected} bytes")
+            if not looks_like_pdf(part):
+                part.unlink(missing_ok=True)
+                raise RuntimeError("downloaded file is not a PDF")
+            part.replace(target)
             return
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except urllib.error.HTTPError as exc:
+            if exc.code == 416 and part.exists() and looks_like_pdf(part):
+                # Range fully satisfied already: the .part holds the complete file.
+                part.replace(target)
+                return
             last_error = exc
-            if destination.exists():
-                destination.unlink()
-            if attempt < attempts:
-                time.sleep(min(2 ** (attempt - 1), 8))
-    raise RuntimeError(f"failed to fetch {url} after {attempts} attempts: {last_error}")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # Keep the .part file so the next attempt resumes from where we stopped.
+            last_error = exc
+        if attempt < attempts:
+            time.sleep(min(2 ** (attempt - 1), 10) + random.uniform(0, 1.0))
+    raise RuntimeError(f"failed to download {entry.pdf_url} after {attempts} attempts: {last_error}")
+
+
+def download_pdf_aria2(entry: CVPRPaperEntry, target: Path, *, timeout: float, attempts: int) -> None:
+    """Resumable, multi-connection download via aria2c when it is available."""
+    completed = subprocess.run(
+        [
+            "aria2c",
+            "--continue=true",
+            "--max-connection-per-server=4",
+            "--split=4",
+            f"--max-tries={attempts}",
+            "--retry-wait=2",
+            f"--timeout={int(timeout)}",
+            "--allow-overwrite=true",
+            "--auto-file-renaming=false",
+            "--summary-interval=0",
+            "--console-log-level=warn",
+            "--user-agent=MetaLibrary CVPR downloader/1.0",
+            "--dir",
+            str(target.parent),
+            "--out",
+            target.name,
+            entry.pdf_url,
+        ],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if completed.returncode != 0 or not looks_like_pdf(target):
+        message = completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else "unknown error"
+        raise RuntimeError(f"aria2c failed for {entry.pdf_url}: {message}")
+
+
+def download_pdf(
+    entry: CVPRPaperEntry,
+    cache_dir: Path,
+    *,
+    timeout: float,
+    attempts: int,
+    force: bool,
+    use_aria2: bool,
+) -> Path:
+    target = cache_dir / entry.filename
+    if target.exists() and not force:
+        if looks_like_pdf(target) and target.stat().st_size > 0:
+            return target  # already cached from a previous run
+        target.unlink()  # corrupt cache entry, fetch again
+    elif force:
+        target.unlink(missing_ok=True)
+        target.with_name(target.name + ".part").unlink(missing_ok=True)
+    if use_aria2:
+        download_pdf_aria2(entry, target, timeout=timeout, attempts=attempts)
+    else:
+        download_pdf_urllib(entry, target, timeout=timeout, attempts=attempts)
+    return target
 
 
 def parse_cvpr_listing(html: str, *, year: int, base_url: str | None = None) -> list[CVPRPaperEntry]:
@@ -230,9 +331,9 @@ def parse_cvpr_listing(html: str, *, year: int, base_url: str | None = None) -> 
     return parser.entries
 
 
-def load_cvpr_entries(year: int, *, timeout: float) -> list[CVPRPaperEntry]:
+def load_cvpr_entries(year: int, *, timeout: float, attempts: int = 6) -> list[CVPRPaperEntry]:
     listing_url = cvpr_all_papers_url(year)
-    html = fetch_url(listing_url, timeout=timeout)
+    html = fetch_url(listing_url, timeout=timeout, attempts=attempts)
     return parse_cvpr_listing(html, year=year, base_url=listing_url)
 
 
@@ -257,64 +358,57 @@ def run_library(args: list[str]) -> dict[str, object]:
     return data
 
 
-def import_entry(entry: CVPRPaperEntry, *, timeout: float) -> dict[str, object]:
-    item = run_library(
-        [
-            "item",
-            "create",
-            "--type",
-            "conference_paper",
-            "--title",
-            entry.title,
-            "--date",
-            str(entry.year),
-            "--url",
-            entry.html_url,
-        ]
-    )
+def import_entry(entry: CVPRPaperEntry, pdf_path: Path) -> dict[str, object]:
+    """Import an already-downloaded PDF into the library.
+
+    The item *is* the file: ``item add`` ingests the PDF (deduplicated by sha256)
+    and returns the item id, then ``paper create`` attaches the bibliographic
+    metadata. Records are created only after the PDF is on disk, so a failed
+    download never leaves orphan rows behind.
+    """
+    item = run_library(["item", "add", str(pdf_path)])
     item_id = str(item["id"])
 
     paper_args = [
         "paper",
         "create",
         item_id,
-        "--publication-title",
+        "--type",
+        "conference_paper",
+        "--title",
+        entry.title,
+        "--issued-date",
+        str(entry.year),
+        "--container-title",
         CVPR_PUBLICATION_TITLE,
         "--publisher",
         CVPR_PUBLISHER,
-        "--published-date",
-        str(entry.year),
-        "--access-date",
-        cvpr_all_papers_url(entry.year),
+        "--url",
+        entry.html_url,
         "--extra",
         entry.extra_payload(),
     ]
+    if entry.authors:
+        paper_args.extend(["--authors", json.dumps(entry.authors, ensure_ascii=True)])
     if entry.pages:
         paper_args.extend(["--pages", entry.pages])
     run_library(paper_args)
 
-    with tempfile.TemporaryDirectory(prefix=f"library-cvpr{entry.year}-") as tmp:
-        pdf_path = Path(tmp) / entry.filename
-        fetch_binary(entry.pdf_url, pdf_path, timeout=timeout)
-        attachment = run_library(
-            [
-                "attachment",
-                "add",
-                item_id,
-                str(pdf_path),
-                "--title",
-                entry.title,
-                "--type",
-                "pdf",
-            ]
-        )
-
     return {
         "item_id": item_id,
-        "attachment_id": attachment.get("id"),
         "title": entry.title,
         "pdf_url": entry.pdf_url,
     }
+
+
+def already_imported(html_url: str) -> bool:
+    """Ask the library (the single source of truth) whether this paper exists.
+
+    Replaces the old /tmp state.json manifest, which could desync from the
+    database. ``paper find`` returns an empty object when nothing matches.
+    """
+    found = run_library(["paper", "find", "--url", html_url])
+    return bool(found.get("item_id"))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -325,13 +419,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--year", type=int, default=2026, help="CVPR year to import, default: 2026")
     parser.add_argument("--limit", type=int, help="import only the first N papers")
     parser.add_argument("--timeout", type=float, default=120.0, help="network timeout in seconds")
+    parser.add_argument("--attempts", type=int, default=6, help="download attempts per PDF, default: 6")
+    parser.add_argument("--workers", type=int, default=4, help="concurrent PDF downloads, default: 4")
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        help="where to cache downloaded PDFs and import state, default: /tmp/metalibrary-cvpr/cvpr<year>",
+    )
+    parser.add_argument("--force", action="store_true", help="re-download and re-import even if cached/imported")
+    parser.add_argument("--no-aria2", action="store_true", help="never use aria2c even if it is installed")
     parser.add_argument("--list-only", action="store_true", help="only list discovered papers without downloading")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    entries = load_cvpr_entries(args.year, timeout=args.timeout)
+    entries = load_cvpr_entries(args.year, timeout=args.timeout, attempts=args.attempts)
 
     if args.limit is not None:
         entries = entries[: args.limit]
@@ -343,11 +446,71 @@ def main() -> int:
             print(f"{index}\t{entry.title}\t{entry.pdf_url}")
         return 0
 
-    for index, entry in enumerate(entries, start=1):
-        result = import_entry(entry, timeout=args.timeout)
-        print(f"{index}/{len(entries)}\t{result['item_id']}\tcreated,pdf\t{result['title']}")
+    cache_dir = args.cache_dir or (DEFAULT_CACHE / f"cvpr{args.year}")
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Import complete: processed={len(entries)} library_root={ROOT}")
+    use_aria2 = not args.no_aria2 and shutil.which("aria2c") is not None
+    if not args.no_aria2 and not use_aria2:
+        print("note: aria2c not found, using built-in resumable downloader.")
+
+    # De-duplicate against the database itself (not an external manifest), so a
+    # wiped/rebuilt library can never be skipped by stale local state.
+    todo = [entry for entry in entries if args.force or not already_imported(entry.html_url)]
+    skipped = len(entries) - len(todo)
+    if skipped:
+        print(f"Skipping {skipped} already-imported papers (use --force to redo).")
+
+    # Phase 1: download PDFs concurrently into the cache (network-bound, parallel-safe).
+    downloaded: dict[str, Path] = {}
+    download_failures: list[tuple[CVPRPaperEntry, Exception]] = []
+    if todo:
+        print(f"Downloading {len(todo)} PDFs with {args.workers} workers...")
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            futures = {
+                pool.submit(
+                    download_pdf,
+                    entry,
+                    cache_dir,
+                    timeout=args.timeout,
+                    attempts=args.attempts,
+                    force=args.force,
+                    use_aria2=use_aria2,
+                ): entry
+                for entry in todo
+            }
+            for future in as_completed(futures):
+                entry = futures[future]
+                try:
+                    downloaded[entry.html_url] = future.result()
+                    print(f"[pdf] ok  {entry.title}")
+                except Exception as exc:  # noqa: BLE001 - report and continue
+                    download_failures.append((entry, exc))
+                    print(f"[pdf] ERR {entry.title}: {exc}", file=sys.stderr)
+
+    # Phase 2: import sequentially (sqlite writes are serialized through scripts/library).
+    imported = 0
+    import_failures: list[tuple[CVPRPaperEntry, Exception]] = []
+    for entry in todo:
+        pdf_path = downloaded.get(entry.html_url)
+        if pdf_path is None:
+            continue
+        try:
+            result = import_entry(entry, pdf_path)
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            import_failures.append((entry, exc))
+            print(f"[lib] ERR {entry.title}: {exc}", file=sys.stderr)
+            continue
+        imported += 1
+        print(f"{imported}/{len(todo)}\t{result['item_id']}\tcreated,pdf\t{result['title']}")
+
+    print(
+        f"Import complete: imported={imported} skipped={skipped} "
+        f"download_failed={len(download_failures)} import_failed={len(import_failures)} "
+        f"cache={cache_dir} library_root={ROOT}"
+    )
+    if download_failures or import_failures:
+        print("Re-run the same command to retry failed papers (downloads resume from cache).", file=sys.stderr)
+        return 1
     return 0
 
 

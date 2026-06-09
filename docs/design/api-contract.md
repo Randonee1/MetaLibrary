@@ -9,14 +9,12 @@ Applications may live under `Applications/`, but they should still treat this AP
 ## Planned Resources
 
 - `GET /items`
-- `POST /items`
+- `POST /items` (upload a file; an item is a stored file)
 - `GET /items/{item_id}`
-- `PATCH /items/{item_id}`
+- `GET /items/{item_id}/file`
 - `DELETE /items/{item_id}`
-- `POST /items/{item_id}/attachments`
-- `GET /items/{item_id}/attachments`
-- `GET /attachments/{attachment_id}/file`
-- `POST /import/file`
+- `PUT /items/{item_id}/paper` (create or update bibliographic metadata)
+- `GET /items/{item_id}/paper`
 - `POST /metadata/resolve`
 - `GET /search`
 
@@ -25,4 +23,4 @@ Applications may live under `Applications/`, but they should still treat this AP
 - Parse and validate request bodies at the boundary.
 - Return stable JSON shapes.
 - Do not expose SQLite internals as public API details.
-- File uploads must be recorded in both `blobs` and `attachments`.
+- An uploaded file is recorded as one `items` row, deduplicated by `sha256`.

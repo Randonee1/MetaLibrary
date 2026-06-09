@@ -8,108 +8,42 @@ from .paths import LibraryPaths
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
 
+-- An item uniquely identifies one stored physical file in MetaLibrary.
+-- It is the durable, content-addressed root that metadata extensions hang off.
 CREATE TABLE IF NOT EXISTS items (
   id TEXT PRIMARY KEY,
-  item_type TEXT NOT NULL,
-  title TEXT NOT NULL,
-  abstract TEXT,
-  language TEXT,
-  date TEXT,
-  url TEXT,
-  doi TEXT,
-  isbn TEXT,
-  extra_json TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS papers (
-  item_id TEXT PRIMARY KEY,
-  publication_title TEXT,
-  journal_abbreviation TEXT,
-  publisher TEXT,
-  published_date TEXT,
-  volume TEXT,
-  issue TEXT,
-  pages TEXT,
-  doi TEXT,
-  pmid TEXT,
-  pmcid TEXT,
-  issn TEXT,
-  citation_key TEXT,
-  access_date TEXT,
-  extra TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS creators (
-  id TEXT PRIMARY KEY,
-  display_name TEXT NOT NULL,
-  given_name TEXT,
-  family_name TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS item_creators (
-  item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-  creator_id TEXT NOT NULL REFERENCES creators(id) ON DELETE CASCADE,
-  role TEXT NOT NULL,
-  position INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (item_id, creator_id, role)
-);
-
-CREATE TABLE IF NOT EXISTS blobs (
-  id TEXT PRIMARY KEY,
   sha256 TEXT NOT NULL UNIQUE,
-  mime_type TEXT,
   size_bytes INTEGER NOT NULL,
+  mime_type TEXT,
   storage_path TEXT NOT NULL UNIQUE,
   original_filename TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS attachments (
-  id TEXT PRIMARY KEY,
-  item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-  blob_id TEXT NOT NULL REFERENCES blobs(id) ON DELETE RESTRICT,
-  attachment_type TEXT NOT NULL DEFAULT 'file',
-  title TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+-- Bibliographic record for an item, generic across conference and journal papers.
+-- Shared primary key (item_id) gives a 1:1 extension of items.
+CREATE TABLE IF NOT EXISTS papers (
+  item_id TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+  type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  authors TEXT,
+  abstract TEXT,
+  issued_date TEXT,
+  container_title TEXT,
+  volume TEXT,
+  issue TEXT,
+  pages TEXT,
+  publisher TEXT,
+  doi TEXT,
+  url TEXT,
+  extra TEXT
 );
 
-CREATE TABLE IF NOT EXISTS tags (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE
-);
-
-CREATE TABLE IF NOT EXISTS item_tags (
-  item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-  tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-  PRIMARY KEY (item_id, tag_id)
-);
-
-CREATE TABLE IF NOT EXISTS collections (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  parent_id TEXT REFERENCES collections(id) ON DELETE CASCADE,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS collection_items (
-  collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
-  item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-  PRIMARY KEY (collection_id, item_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_items_type ON items(item_type);
-CREATE INDEX IF NOT EXISTS idx_items_title ON items(title);
-CREATE INDEX IF NOT EXISTS idx_items_doi ON items(doi);
+CREATE INDEX IF NOT EXISTS idx_items_sha256 ON items(sha256);
+CREATE INDEX IF NOT EXISTS idx_papers_type ON papers(type);
+CREATE INDEX IF NOT EXISTS idx_papers_title ON papers(title);
 CREATE INDEX IF NOT EXISTS idx_papers_doi ON papers(doi);
-CREATE INDEX IF NOT EXISTS idx_papers_publication_title ON papers(publication_title);
-CREATE INDEX IF NOT EXISTS idx_attachments_item ON attachments(item_id);
-CREATE INDEX IF NOT EXISTS idx_blobs_sha256 ON blobs(sha256);
+CREATE INDEX IF NOT EXISTS idx_papers_url ON papers(url);
 """
 
 
